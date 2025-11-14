@@ -1,0 +1,477 @@
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             f1_score, confusion_matrix, classification_report,
+                             roc_curve, roc_auc_score)
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set style
+sns.set_style("whitegrid")
+plt.rcParams['figure.figsize'] = (14, 8)
+
+print("="*80)
+print("COVID-19 CLASSIFICATION PROJECT - MALAYSIA")
+print("Predicting High/Low Case Periods Using Real Government Data")
+print("="*80)
+
+# ============================================================================
+# STEP 1: LOAD REAL COVID-19 DATA FROM MALAYSIAN MINISTRY OF HEALTH
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 1: LOADING REAL COVID-19 DATA FROM MINISTRY OF HEALTH MALAYSIA")
+print("="*80)
+
+# Load multiple datasets
+print("\nDownloading datasets from official MOH GitHub repository...")
+
+try:
+    # Cases data
+    cases_url = 'https://raw.githubusercontent.com/MoH-Malaysia/covid19-public/main/epidemic/cases_malaysia.csv'
+    df_cases = pd.read_csv(cases_url)
+    print(f"✓ Cases data loaded: {df_cases.shape[0]} rows")
+
+    # Deaths data
+    deaths_url = 'https://raw.githubusercontent.com/MoH-Malaysia/covid19-public/main/epidemic/deaths_malaysia.csv'
+    df_deaths = pd.read_csv(deaths_url)
+    print(f"✓ Deaths data loaded: {df_deaths.shape[0]} rows")
+
+    # Tests data
+    tests_url = 'https://raw.githubusercontent.com/MoH-Malaysia/covid19-public/main/epidemic/tests_malaysia.csv'
+    df_tests = pd.read_csv(tests_url)
+    print(f"✓ Tests data loaded: {df_tests.shape[0]} rows")
+
+    # Hospital data
+    hospital_url = 'https://raw.githubusercontent.com/MoH-Malaysia/covid19-public/main/epidemic/hospital.csv'
+    df_hospital = pd.read_csv(hospital_url)
+    print(f"✓ Hospital data loaded: {df_hospital.shape[0]} rows")
+
+except Exception as e:
+    print(f"Error loading data: {e}")
+    print("Please check your internet connection or the URLs.")
+    exit()
+
+print("\n✓ All datasets successfully loaded!")
+
+# ============================================================================
+# STEP 2: DATA PREPROCESSING & FEATURE ENGINEERING
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 2: DATA PREPROCESSING & FEATURE ENGINEERING")
+print("="*80)
+
+# Merge all datasets on date
+df_cases['date'] = pd.to_datetime(df_cases['date'])
+df_deaths['date'] = pd.to_datetime(df_deaths['date'])
+df_tests['date'] = pd.to_datetime(df_tests['date'])
+df_hospital['date'] = pd.to_datetime(df_hospital['date'])
+
+# Merge
+df = df_cases.merge(df_deaths[['date', 'deaths_new']], on='date', how='left')
+df = df.merge(df_tests[['date', 'rtk-ag', 'pcr']], on='date', how='left')
+df = df.merge(df_hospital[['date', 'admitted_covid', 'discharged_covid', 'hosp_covid']],
+              on='date', how='left')
+
+print(f"\n✓ Merged dataset shape: {df.shape}")
+print(f"Date range: {df['date'].min()} to {df['date'].max()}")
+
+# Fill missing values
+df = df.fillna(0)
+
+# Feature Engineering
+print("\nCreating advanced features...")
+
+# 1. Rolling averages (7-day and 14-day)
+df['cases_7day_avg'] = df['cases_new'].rolling(window=7, min_periods=1).mean()
+df['cases_14day_avg'] = df['cases_new'].rolling(window=14, min_periods=1).mean()
+df['deaths_7day_avg'] = df['deaths_new'].rolling(window=7, min_periods=1).mean()
+
+# 2. Rolling standard deviation (volatility)
+df['cases_7day_std'] = df['cases_new'].rolling(window=7, min_periods=1).std()
+
+# 3. Trend features
+df['cases_trend'] = df['cases_new'] - df['cases_7day_avg']
+df['cases_pct_change'] = df['cases_new'].pct_change(fill_method=None).fillna(0)
+
+# 4. Testing features
+df['total_tests'] = df['rtk-ag'] + df['pcr']
+df['positivity_rate'] = np.where(df['total_tests'] > 0,
+                                   df['cases_new'] / df['total_tests'], 0)
+
+# 5. Hospital pressure features
+df['hospital_admission_rate'] = df['admitted_covid'].fillna(0)
+df['hospital_occupancy'] = df['hosp_covid'].fillna(0)
+
+# 6. Time-based features
+df['day_of_week'] = df['date'].dt.dayofweek
+df['month'] = df['date'].dt.month
+df['day_of_year'] = df['date'].dt.dayofyear
+
+# 7. Lagged features (previous day's cases)
+df['cases_lag1'] = df['cases_new'].shift(1).fillna(0)
+df['cases_lag3'] = df['cases_new'].shift(3).fillna(0)
+df['cases_lag7'] = df['cases_new'].shift(7).fillna(0)
+
+print("✓ Feature engineering complete!")
+print(f"\nTotal features created: {df.shape[1]}")
+
+# ============================================================================
+# STEP 3: CREATE TARGET VARIABLE (HIGH/LOW CASES)
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 3: CREATING TARGET VARIABLE")
+print("="*80)
+
+# Define threshold for HIGH/LOW cases (using median)
+threshold = df['cases_new'].median()
+df['target'] = (df['cases_new'] > threshold).astype(int)
+
+print(f"\nThreshold for HIGH cases: {threshold:.0f} cases")
+print(f"\nClass distribution:")
+print(df['target'].value_counts())
+print(f"\nClass balance: {df['target'].value_counts(normalize=True).round(3)}")
+
+# ============================================================================
+# STEP 4: EXPLORATORY DATA ANALYSIS
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 4: EXPLORATORY DATA ANALYSIS")
+print("="*80)
+
+fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+fig.suptitle('COVID-19 Data Exploration - Malaysia', fontsize=16, fontweight='bold')
+
+# 1. Daily cases over time
+axes[0, 0].plot(df['date'], df['cases_new'], linewidth=1, alpha=0.7, color='#3b82f6')
+axes[0, 0].plot(df['date'], df['cases_7day_avg'], linewidth=2, color='#ef4444',
+                label='7-day average')
+axes[0, 0].axhline(y=threshold, color='green', linestyle='--', linewidth=2,
+                   label=f'Threshold ({threshold:.0f})')
+axes[0, 0].set_title('Daily COVID-19 Cases', fontweight='bold')
+axes[0, 0].set_ylabel('Cases')
+axes[0, 0].legend()
+axes[0, 0].grid(True, alpha=0.3)
+
+# 2. Target distribution
+df['target'].value_counts().plot(kind='bar', ax=axes[0, 1], color=['#10b981', '#ef4444'])
+axes[0, 1].set_title('Target Distribution (0=LOW, 1=HIGH)', fontweight='bold')
+axes[0, 1].set_xlabel('Class')
+axes[0, 1].set_ylabel('Count')
+axes[0, 1].set_xticklabels(['LOW Cases', 'HIGH Cases'], rotation=0)
+
+# 3. Deaths over time
+axes[1, 0].plot(df['date'], df['deaths_new'], linewidth=1, alpha=0.7, color='#8b5cf6')
+axes[1, 0].plot(df['date'], df['deaths_7day_avg'], linewidth=2, color='#ef4444',
+                label='7-day average')
+axes[1, 0].set_title('Daily Deaths', fontweight='bold')
+axes[1, 0].set_ylabel('Deaths')
+axes[1, 0].legend()
+axes[1, 0].grid(True, alpha=0.3)
+
+# 4. Positivity rate
+axes[1, 1].plot(df['date'], df['positivity_rate'] * 100, linewidth=1, color='#f59e0b')
+axes[1, 1].set_title('Test Positivity Rate', fontweight='bold')
+axes[1, 1].set_ylabel('Positivity Rate (%)')
+axes[1, 1].grid(True, alpha=0.3)
+
+# 5. Hospital occupancy
+axes[2, 0].fill_between(df['date'], df['hospital_occupancy'],
+                        alpha=0.6, color='#ec4899')
+axes[2, 0].set_title('Hospital Occupancy (COVID Patients)', fontweight='bold')
+axes[2, 0].set_ylabel('Patients')
+axes[2, 0].grid(True, alpha=0.3)
+
+# 6. Cases by day of week
+cases_by_dow = df.groupby('day_of_week')['cases_new'].mean()
+days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+axes[2, 1].bar(range(7), cases_by_dow, color='#6366f1')
+axes[2, 1].set_xticks(range(7))
+axes[2, 1].set_xticklabels(days)
+axes[2, 1].set_title('Average Cases by Day of Week', fontweight='bold')
+axes[2, 1].set_ylabel('Average Cases')
+axes[2, 1].grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+plt.savefig('01_covid19_exploration.png', dpi=300, bbox_inches='tight')
+print("\n✓ Saved: 01_covid19_exploration.png")
+plt.show()
+
+# ============================================================================
+# STEP 5: PREPARE DATA FOR MACHINE LEARNING
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 5: PREPARING DATA FOR MACHINE LEARNING")
+print("="*80)
+
+# Select features
+feature_cols = [
+    'cases_7day_avg', 'cases_14day_avg', 'cases_7day_std',
+    'cases_trend', 'cases_pct_change', 'deaths_7day_avg',
+    'total_tests', 'positivity_rate', 'hospital_admission_rate',
+    'hospital_occupancy', 'day_of_week', 'month',
+    'cases_lag1', 'cases_lag3', 'cases_lag7'
+]
+
+# Remove rows with NaN (from rolling calculations)
+df_clean = df[feature_cols + ['target']].dropna()
+
+X = df_clean[feature_cols]
+y = df_clean['target']
+
+print(f"\nFinal dataset shape: {X.shape}")
+print(f"Features used: {len(feature_cols)}")
+print(f"Samples: {len(X)}")
+
+# Split data (80-20 split)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+print(f"\nTrain set: {X_train.shape[0]} samples")
+print(f"Test set: {X_test.shape[0]} samples")
+
+# Scale features
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+print("\n✓ Features scaled using StandardScaler")
+
+# ============================================================================
+# STEP 6: TRAIN CLASSIFICATION MODELS
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 6: TRAINING CLASSIFICATION MODELS")
+print("="*80)
+
+# Model 1: Logistic Regression
+print("\n1. Training Logistic Regression...")
+lr_model = LogisticRegression(max_iter=1000, random_state=42)
+lr_model.fit(X_train_scaled, y_train)
+lr_pred = lr_model.predict(X_test_scaled)
+lr_proba = lr_model.predict_proba(X_test_scaled)[:, 1]
+
+lr_acc = accuracy_score(y_test, lr_pred)
+lr_prec = precision_score(y_test, lr_pred)
+lr_rec = recall_score(y_test, lr_pred)
+lr_f1 = f1_score(y_test, lr_pred)
+lr_auc = roc_auc_score(y_test, lr_proba)
+
+print(f"   Accuracy:  {lr_acc:.4f}")
+print(f"   Precision: {lr_prec:.4f}")
+print(f"   Recall:    {lr_rec:.4f}")
+print(f"   F1-Score:  {lr_f1:.4f}")
+print(f"   ROC AUC:   {lr_auc:.4f}")
+
+# Model 2: Random Forest
+print("\n2. Training Random Forest...")
+rf_model = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=10)
+rf_model.fit(X_train_scaled, y_train)
+rf_pred = rf_model.predict(X_test_scaled)
+rf_proba = rf_model.predict_proba(X_test_scaled)[:, 1]
+
+rf_acc = accuracy_score(y_test, rf_pred)
+rf_prec = precision_score(y_test, rf_pred)
+rf_rec = recall_score(y_test, rf_pred)
+rf_f1 = f1_score(y_test, rf_pred)
+rf_auc = roc_auc_score(y_test, rf_proba)
+
+print(f"   Accuracy:  {rf_acc:.4f}")
+print(f"   Precision: {rf_prec:.4f}")
+print(f"   Recall:    {rf_rec:.4f}")
+print(f"   F1-Score:  {rf_f1:.4f}")
+print(f"   ROC AUC:   {rf_auc:.4f}")
+
+# ============================================================================
+# STEP 7: MODEL EVALUATION & VISUALIZATION
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 7: MODEL EVALUATION & VISUALIZATION")
+print("="*80)
+
+# Choose best model (Random Forest typically performs better)
+best_model = rf_model
+best_pred = rf_pred
+best_proba = rf_proba
+best_name = "Random Forest"
+
+fig = plt.figure(figsize=(16, 10))
+gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+
+# 1. Model Comparison
+ax1 = fig.add_subplot(gs[0, 0])
+models_comp = pd.DataFrame({
+    'Model': ['Logistic Regression', 'Random Forest'],
+    'Accuracy': [lr_acc, rf_acc],
+    'F1-Score': [lr_f1, rf_f1],
+    'ROC AUC': [lr_auc, rf_auc]
+})
+x_pos = np.arange(len(models_comp))
+width = 0.25
+ax1.bar(x_pos - width, models_comp['Accuracy'], width, label='Accuracy', color='#10b981')
+ax1.bar(x_pos, models_comp['F1-Score'], width, label='F1-Score', color='#3b82f6')
+ax1.bar(x_pos + width, models_comp['ROC AUC'], width, label='ROC AUC', color='#8b5cf6')
+ax1.set_xticks(x_pos)
+ax1.set_xticklabels(models_comp['Model'], rotation=15, ha='right')
+ax1.set_ylabel('Score')
+ax1.set_title('Model Comparison', fontweight='bold')
+ax1.legend()
+ax1.set_ylim(0, 1)
+ax1.grid(True, alpha=0.3, axis='y')
+
+# 2. Confusion Matrix
+ax2 = fig.add_subplot(gs[0, 1])
+cm = confusion_matrix(y_test, best_pred)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax2,
+            xticklabels=['LOW', 'HIGH'], yticklabels=['LOW', 'HIGH'])
+ax2.set_title(f'Confusion Matrix ({best_name})', fontweight='bold')
+ax2.set_ylabel('True Label')
+ax2.set_xlabel('Predicted Label')
+
+# 3. ROC Curve
+ax3 = fig.add_subplot(gs[0, 2])
+fpr_lr, tpr_lr, _ = roc_curve(y_test, lr_proba)
+fpr_rf, tpr_rf, _ = roc_curve(y_test, rf_proba)
+ax3.plot(fpr_lr, tpr_lr, label=f'Logistic Reg (AUC={lr_auc:.3f})', linewidth=2, color='#3b82f6')
+ax3.plot(fpr_rf, tpr_rf, label=f'Random Forest (AUC={rf_auc:.3f})', linewidth=2, color='#10b981')
+ax3.plot([0, 1], [0, 1], 'k--', linewidth=1)
+ax3.set_xlabel('False Positive Rate')
+ax3.set_ylabel('True Positive Rate')
+ax3.set_title('ROC Curves', fontweight='bold')
+ax3.legend()
+ax3.grid(True, alpha=0.3)
+
+# 4. Feature Importance (Random Forest)
+ax4 = fig.add_subplot(gs[1, :])
+feature_imp = pd.DataFrame({
+    'feature': feature_cols,
+    'importance': rf_model.feature_importances_
+}).sort_values('importance', ascending=False).head(10)
+
+colors_imp = plt.cm.viridis(np.linspace(0.3, 0.9, len(feature_imp)))
+ax4.barh(range(len(feature_imp)), feature_imp['importance'], color=colors_imp)
+ax4.set_yticks(range(len(feature_imp)))
+ax4.set_yticklabels(feature_imp['feature'])
+ax4.set_xlabel('Importance')
+ax4.set_title('Top 10 Most Important Features (Random Forest)', fontweight='bold')
+ax4.grid(True, alpha=0.3, axis='x')
+
+# 5. Classification Report
+ax5 = fig.add_subplot(gs[2, 0])
+report = classification_report(y_test, best_pred, output_dict=True)
+report_df = pd.DataFrame(report).transpose()[:-3]  # Exclude support rows
+sns.heatmap(report_df.iloc[:, :-1], annot=True, fmt='.2f', cmap='YlGnBu',
+            ax=ax5, cbar_kws={'label': 'Score'})
+ax5.set_title('Classification Report', fontweight='bold')
+ax5.set_ylabel('Class')
+
+# 6. Prediction Distribution
+ax6 = fig.add_subplot(gs[2, 1])
+ax6.hist(best_proba[y_test==0], bins=30, alpha=0.6, label='LOW Cases', color='#10b981')
+ax6.hist(best_proba[y_test==1], bins=30, alpha=0.6, label='HIGH Cases', color='#ef4444')
+ax6.axvline(x=0.5, color='black', linestyle='--', linewidth=2, label='Threshold')
+ax6.set_xlabel('Predicted Probability')
+ax6.set_ylabel('Frequency')
+ax6.set_title('Prediction Probability Distribution', fontweight='bold')
+ax6.legend()
+ax6.grid(True, alpha=0.3)
+
+# 7. Performance Metrics Summary
+ax7 = fig.add_subplot(gs[2, 2])
+ax7.axis('off')
+metrics_text = f"""
+BEST MODEL: {best_name}
+
+Performance Metrics:
+━━━━━━━━━━━━━━━━━━━━━━
+Accuracy:     {rf_acc:.4f} ({rf_acc*100:.2f}%)
+Precision:    {rf_prec:.4f} ({rf_prec*100:.2f}%)
+Recall:       {rf_rec:.4f} ({rf_rec*100:.2f}%)
+F1-Score:     {rf_f1:.4f} ({rf_f1*100:.2f}%)
+ROC AUC:      {rf_auc:.4f} ({rf_auc*100:.2f}%)
+
+Data Summary:
+━━━━━━━━━━━━━━━━━━━━━━
+Training samples:  {len(X_train)}
+Testing samples:   {len(X_test)}
+Features used:     {len(feature_cols)}
+
+Confusion Matrix:
+━━━━━━━━━━━━━━━━━━━━━━
+True Positives:    {cm[1,1]}
+False Positives:   {cm[0,1]}
+True Negatives:    {cm[0,0]}
+False Negatives:   {cm[1,0]}
+"""
+ax7.text(0.1, 0.5, metrics_text, fontsize=11, family='monospace',
+         verticalalignment='center', bbox=dict(boxstyle='round',
+         facecolor='wheat', alpha=0.3))
+
+plt.savefig('02_covid19_model_evaluation.png', dpi=300, bbox_inches='tight')
+print("\n✓ Saved: 02_covid19_model_evaluation.png")
+plt.show()
+
+# ============================================================================
+# STEP 8: SAVE RESULTS
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 8: SAVING RESULTS")
+print("="*80)
+
+# Save predictions
+results_df = pd.DataFrame({
+    'Actual': y_test.values,
+    'Predicted': best_pred,
+    'Probability_HIGH': best_proba,
+    'Correct': (y_test.values == best_pred)
+})
+results_df.to_csv('covid19_predictions.csv', index=False)
+print("✓ Saved: covid19_predictions.csv")
+
+# Save feature importance
+feature_importance_df = pd.DataFrame({
+    'Feature': feature_cols,
+    'Importance': rf_model.feature_importances_
+}).sort_values('Importance', ascending=False)
+feature_importance_df.to_csv('covid19_feature_importance.csv', index=False)
+print("✓ Saved: covid19_feature_importance.csv")
+
+# Save model summary
+with open('covid19_model_summary.txt', 'w') as f:
+    f.write("="*80 + "\n")
+    f.write("COVID-19 CLASSIFICATION MODEL SUMMARY - MALAYSIA\n")
+    f.write("="*80 + "\n\n")
+    f.write(f"Data Source: Ministry of Health Malaysia\n")
+    f.write(f"Date Range: {df['date'].min()} to {df['date'].max()}\n")
+    f.write(f"Total Samples: {len(df)}\n")
+    f.write(f"Training Samples: {len(X_train)}\n")
+    f.write(f"Testing Samples: {len(X_test)}\n\n")
+    f.write(f"Best Model: {best_name}\n\n")
+    f.write("Performance Metrics:\n")
+    f.write(f"  - Accuracy:  {rf_acc:.4f} ({rf_acc*100:.2f}%)\n")
+    f.write(f"  - Precision: {rf_prec:.4f} ({rf_prec*100:.2f}%)\n")
+    f.write(f"  - Recall:    {rf_rec:.4f} ({rf_rec*100:.2f}%)\n")
+    f.write(f"  - F1-Score:  {rf_f1:.4f} ({rf_f1*100:.2f}%)\n")
+    f.write(f"  - ROC AUC:   {rf_auc:.4f} ({rf_auc*100:.2f}%)\n\n")
+    f.write("Classification Report:\n")
+    f.write(classification_report(y_test, best_pred))
+
+print("✓ Saved: covid19_model_summary.txt")
+
+print("\n" + "="*80)
+print("PROJECT COMPLETE! 🎉")
+print("="*80)
+print("\nGenerated Files:")
+print("  1. 01_covid19_exploration.png - Data visualization")
+print("  2. 02_covid19_model_evaluation.png - Model performance")
+print("  3. covid19_predictions.csv - Test predictions")
+print("  4. covid19_feature_importance.csv - Feature rankings")
+print("  5. covid19_model_summary.txt - Comprehensive report")
+print("\n" + "="*80)
